@@ -1625,6 +1625,7 @@ impl Document {
     }
 
     pub(crate) fn recovery_saved(&mut self, text: &Rope) {
+        self.recovery.mark_written(self.last_saved_revision);
         // A save started before recovery may complete afterwards. Only the
         // recovered revision's own successful save releases its autosave guard.
         if !self.is_modified() {
@@ -1645,13 +1646,14 @@ impl Document {
         );
     }
 
-    pub fn recover(&mut self, snapshot: Snapshot, view: &View) -> anyhow::Result<()> {
+    pub fn recover(&mut self, recovered: recovery::Recovery, view: &View) -> anyhow::Result<()> {
         anyhow::ensure!(!self.is_modified(), "Cannot recover into a modified buffer");
         anyhow::ensure!(
             !self.recovery.pending(),
             "Wait for pending recovery I/O before recovering"
         );
         anyhow::ensure!(!self.readonly, "Cannot recover into a readonly buffer");
+        let snapshot = &recovered.snapshot;
         let encoding = Encoding::for_label(snapshot.encoding.as_bytes())
             .ok_or_else(|| anyhow!("Unknown recovery encoding: {}", snapshot.encoding))?;
         let line_ending = match snapshot.line_ending.as_str() {
@@ -1696,6 +1698,7 @@ impl Document {
             )),
         )
         .with_selection(selection);
+        recovered.check()?;
         self.recovering = true;
         let success = self.apply(&transaction, view.id);
         self.recovering = false;
@@ -1711,11 +1714,9 @@ impl Document {
             .commit_revision(&transaction, &old_state);
         self.changes = ChangeSet::new(self.text.slice(..));
         self.old_state = None;
-        if self.config.load().recovery.enable {
-            self.recovery.recovered(self.recovery_snapshot(view.id));
-        } else {
-            self.recovery.disable();
-        }
+        let revision = self.get_current_revision();
+        self.recovery
+            .recovered(recovered, self.recovery_snapshot(view.id), revision);
         Ok(())
     }
 

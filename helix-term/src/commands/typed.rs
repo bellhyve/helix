@@ -164,6 +164,32 @@ fn preserve(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> an
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RecoveryDiskStatus {
+    size: Option<u64>,
+    // Keep filesystem precision when checking for changes during the prompt.
+    modified: Option<std::time::SystemTime>,
+}
+
+impl RecoveryDiskStatus {
+    fn sample(snapshot: &recovery::Snapshot) -> Self {
+        let metadata = snapshot
+            .path
+            .as_ref()
+            .and_then(|path| std::fs::metadata(snapshot.cwd.join(path)).ok());
+        Self {
+            size: metadata.as_ref().map(|metadata| metadata.len()),
+            modified: metadata.and_then(|metadata| metadata.modified().ok()),
+        }
+    }
+
+    fn modified_seconds(self) -> Option<u64> {
+        self.modified
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+    }
+}
+
 fn recover(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
@@ -174,7 +200,9 @@ fn recover(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
         "Wait for pending saves and on-save jobs before recovering"
     );
     let config = cx.editor.config().recovery.clone();
-    let doc = doc!(cx.editor);
+    let (view, doc) = current!(cx.editor);
+    let expected_view = view.id;
+    let expected_doc = doc.id();
     if args.is_empty() {
         ensure!(!doc.is_modified(), "Cannot recover into a modified buffer");
     }
@@ -184,13 +212,15 @@ fn recover(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
     });
     let explicit = path.as_deref().and_then(|path| {
         let result = recovery::read(path);
-        let looks_like_swap = path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(".helix-recovery-"));
+        let looks_like_swap = path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with(".helix-recovery-") || name.starts_with(".helix-recovered-")
+        });
         (result.is_ok() || looks_like_swap).then_some(result)
     });
-    let (swap_path, snapshot) = if let Some(result) = explicit {
-        (path.as_ref().unwrap().clone(), result?)
+    let swap_path = if let Some(result) = explicit {
+        result?;
+        path.as_ref().unwrap().clone()
     } else {
         let original = path.as_deref().or(doc.path());
         let found = recovery::discover(&config, original, &cwd)?;
@@ -221,32 +251,167 @@ fn recover(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyh
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let swap_path = found.candidates.into_iter().next().unwrap();
-        let snapshot = recovery::read(&swap_path)?;
-        (swap_path, snapshot)
+        found.candidates.into_iter().next().unwrap()
     };
-    if let Some(path) = snapshot.path.as_deref() {
-        let path = snapshot.cwd.join(path);
-        if let Some(doc) = cx.editor.document_by_path(&path) {
-            ensure!(!doc.is_modified(), "Cannot recover into a modified buffer");
-            ensure!(
-                !doc.recovery_pending(),
-                "Wait for pending recovery I/O before recovering"
-            );
+    let recovered = recovery::claim(&swap_path, &config)?;
+    let disk = RecoveryDiskStatus::sample(&recovered.snapshot);
+    if disk
+        .modified_seconds()
+        .is_some_and(|modified| modified > recovered.metadata.timestamp)
+    {
+        // Install after the command prompt pops, retaining the claim until an answer.
+        cx.jobs.add(
+            Job::with_callback(async move {
+                Ok(job::Callback::EditorCompositor(Box::new(
+                    move |editor, compositor| {
+                        if editor.should_close() {
+                            return;
+                        }
+                        if view!(editor).id != expected_view || view!(editor).doc != expected_doc {
+                            editor.set_error("Recovery cancelled: current view or buffer changed");
+                            return;
+                        }
+                        let mut recovered = Some(recovered);
+                        compositor.push(Box::new(ui::Prompt::new(
+                            "Warning: Recovery file is older than the saved file! Continue? (y/N) "
+                                .into(),
+                            None,
+                            completers::none,
+                            move |cx, input, event| {
+                                if event == PromptEvent::Update {
+                                    return;
+                                }
+                                let Some(recovered) = recovered.take() else {
+                                    return;
+                                };
+                                if event != PromptEvent::Validate
+                                    || !(input.eq_ignore_ascii_case("y")
+                                        || input.eq_ignore_ascii_case("yes"))
+                                {
+                                    return;
+                                }
+                                if let Err(error) = recover_impl(
+                                    cx,
+                                    recovered,
+                                    expected_view,
+                                    expected_doc,
+                                    Some(disk),
+                                ) {
+                                    cx.editor.set_error(format!("{error:#}"));
+                                }
+                            },
+                        )));
+                    },
+                )))
+            })
+            .wait_before_exiting(),
+        );
+        return Ok(());
+    }
+    recover_impl(cx, recovered, expected_view, expected_doc, Some(disk))
+}
+
+fn recover_impl(
+    cx: &mut compositor::Context,
+    recovered: recovery::Recovery,
+    expected_view: ViewId,
+    expected_doc: DocumentId,
+    expected_disk: Option<RecoveryDiskStatus>,
+) -> anyhow::Result<()> {
+    ensure!(
+        !cx.editor.should_close()
+            && view!(cx.editor).id == expected_view
+            && view!(cx.editor).doc == expected_doc,
+        "Recovery cancelled: current view or buffer changed"
+    );
+    ensure!(
+        cx.editor.write_count == 0 && cx.jobs.wait_futures.is_empty(),
+        "Wait for pending saves and on-save jobs before recovering"
+    );
+    let snapshot = &recovered.snapshot;
+    let disk = RecoveryDiskStatus::sample(snapshot);
+    ensure!(
+        expected_disk.is_none_or(|expected| expected == disk),
+        "file changed while waiting; run :recover again"
+    );
+    let path = snapshot.path.as_ref().map(|path| snapshot.cwd.join(path));
+    let target = match path.as_deref() {
+        Some(path) => cx.editor.document_by_path(path),
+        None => {
+            let doc = doc!(cx.editor);
+            (doc.path().is_none() && !doc.is_modified()).then_some(doc)
         }
+    };
+    if let Some(doc) = target {
+        ensure!(!doc.is_modified(), "Cannot recover into a modified buffer");
+        ensure!(!doc.readonly, "Cannot recover into a readonly buffer");
+        ensure!(
+            !doc.recovery_pending(),
+            "Wait for pending recovery I/O before recovering"
+        );
+    }
+    let metadata = &recovered.metadata;
+    let modified = disk.modified_seconds();
+    let metadata_unknown = disk.size.is_none()
+        || modified.is_none()
+        || metadata.original_size.is_none()
+        || metadata.original_modified.is_none();
+    let disk_status = if path.is_none() {
+        "unnamed; disk metadata unknown"
+    } else if disk
+        .size
+        .zip(metadata.original_size)
+        .is_some_and(|(a, b)| a != b)
+        || modified
+            .zip(metadata.original_modified)
+            .is_some_and(|(a, b)| a != b)
+    {
+        if metadata_unknown {
+            "apparent disk change; some metadata unknown"
+        } else {
+            "size/mtime differ: apparent disk change"
+        }
+    } else if metadata_unknown {
+        "metadata unknown/incomplete (missing file or unavailable stats)"
+    } else {
+        "size/mtime match; content not verified"
+    };
+    let keep_recovered = cx.editor.config().recovery.keep_recovered;
+    let timestamp = i64::try_from(metadata.timestamp)
+        .ok()
+        .and_then(|seconds| jiff::Timestamp::from_second(seconds).ok())
+        .map(|timestamp| timestamp.to_string())
+        .unwrap_or_else(|| format!("{} seconds since Unix epoch", metadata.timestamp));
+    let report = format!(
+        "Recovered from {}\nOriginal: {}; snapshot: {}, {} text bytes\nDisk: {}{}\nRestored text, encoding/BOM, line ending and selections. Nothing written; review before :write{}.\nThe original snapshot will be backed up before this swap is changed or removed. {}",
+        recovered.path().display(),
+        path.as_ref().map_or_else(|| "[unnamed]".into(), |path| path.display().to_string()),
+        timestamp,
+        snapshot.text.len_bytes(),
+        disk_status,
+        if modified.is_some_and(|modified| modified > metadata.timestamp) {
+            "; saved file is newer than snapshot"
+        } else {
+            ""
+        },
+        if path.is_none() { " <filename>" } else { "" },
+        if keep_recovered {
+            "Backup retained after close (keep-recovered=true)."
+        } else {
+            "Backup retained unless recovered work is successfully written and the buffer intentionally closed."
+        },
+    );
+    if let Some(path) = path {
         cx.editor.open(&path, Action::Replace)?;
     } else if doc!(cx.editor).path().is_some() || doc!(cx.editor).is_modified() {
         cx.editor.new_file(Action::Replace);
     }
     cx.editor.enter_normal_mode();
     let (view, doc) = current!(cx.editor);
-    doc.recover(snapshot, view)?;
+    doc.recover(recovered, view)?;
     view.sync_changes(doc);
     align_view(doc, view, Align::Center);
-    cx.editor.set_warning(format!(
-        "Recovered from {}; nothing written. Review and :write explicitly; remove the old swap manually.",
-        swap_path.display()
-    ));
+    cx.editor.set_warning(report);
     Ok(())
 }
 
@@ -548,7 +713,7 @@ fn write_impl(
                 });
             if fmt_job.is_none() {
                 if let Err(err) = editor.save(doc_id, path, force) {
-                    editor.set_error(format!("Error saving: {}", err));
+                    return Some(Job::new(async move { Err(err) }).wait_before_exiting());
                 }
             }
             fmt_job
@@ -683,6 +848,7 @@ fn write_buffer_close(
         return Ok(());
     }
 
+    let document_id = doc!(cx.editor).id();
     write_impl(
         cx,
         args.first(),
@@ -693,8 +859,7 @@ fn write_buffer_close(
         },
     )?;
 
-    let document_ids = buffer_gather_paths_impl(cx.editor, args);
-    buffer_close_by_ids_impl(cx, &document_ids, false)
+    buffer_close_by_ids_impl(cx, &[document_id], false)
 }
 
 fn force_write_buffer_close(
@@ -706,6 +871,7 @@ fn force_write_buffer_close(
         return Ok(());
     }
 
+    let document_id = doc!(cx.editor).id();
     write_impl(
         cx,
         args.first(),
@@ -716,8 +882,7 @@ fn force_write_buffer_close(
         },
     )?;
 
-    let document_ids = buffer_gather_paths_impl(cx.editor, args);
-    buffer_close_by_ids_impl(cx, &document_ids, false)
+    buffer_close_by_ids_impl(cx, &[document_id], false)
 }
 
 fn new_file(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
@@ -1056,7 +1221,7 @@ pub fn write_all_impl(
                     });
                 if fmt_job.is_none() {
                     if let Err(err) = editor.save::<PathBuf>(doc_id, None, force) {
-                        editor.set_error(format!("Error saving: {}", err));
+                        return Some(Job::new(async move { Err(err) }).wait_before_exiting());
                     }
                 }
                 fmt_job

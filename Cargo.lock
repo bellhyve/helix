@@ -1807,6 +1807,7 @@ dependencies = [
  "ignore",
  "indexmap",
  "indoc",
+ "jiff",
  "libc",
  "log",
  "nucleo",
@@ -1903,6 +1904,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

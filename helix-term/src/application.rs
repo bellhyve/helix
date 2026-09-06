@@ -1718,6 +1718,10 @@ impl Application {
 
         self.restore_term()?;
 
+        for path in &self.editor.retained_recovery_backups {
+            eprintln!("Recovery backup retained: {}", path.display());
+        }
+
         for err in close_errs {
             self.editor.exit_code = 1;
             eprintln!("Error: {}", err);

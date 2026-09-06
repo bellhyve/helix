@@ -14,7 +14,7 @@ use tokio::{
     time::{Instant, Sleep},
 };
 
-use super::{Config, Snapshot, Swap};
+use super::{Config, Recovery, Snapshot, Swap};
 
 /// One serialized writer and one replaceable pending snapshot per document.
 /// Timers and workers are driven exclusively by the editor polling this state.
@@ -38,6 +38,8 @@ pub(crate) struct State {
     unnamed_reported: bool,
     oversized: bool,
     notice: Option<String>,
+    recovered_revision: Option<usize>,
+    recovered_written: bool,
     closed: bool,
 }
 
@@ -79,6 +81,8 @@ impl Default for State {
             unnamed_reported: false,
             oversized: false,
             notice: None,
+            recovered_revision: None,
+            recovered_written: false,
             closed: false,
         }
     }
@@ -116,9 +120,30 @@ impl State {
         }
     }
 
-    pub(crate) fn recovered(&mut self, snapshot: Snapshot) {
+    pub(crate) fn recovered(
+        &mut self,
+        recovered: Recovery,
+        mut snapshot: Snapshot,
+        revision: usize,
+    ) {
         self.disable();
+        self.recovered_revision = Some(revision);
+        self.recovered_written = false;
+        self.cwd = recovered.snapshot.cwd.clone();
+        snapshot.cwd.clone_from(&self.cwd);
+        self.published_path = Some(recovered.path().to_owned());
+        self.swap.lock().adopt(recovered);
         self.cached = Some(snapshot);
+    }
+
+    pub(crate) fn mark_written(&mut self, revision: usize) {
+        // A save of a revision preceding recovery must not authorize backup deletion.
+        if self
+            .recovered_revision
+            .is_some_and(|recovered| revision >= recovered)
+        {
+            self.recovered_written = true;
+        }
     }
 
     pub(crate) fn record(&mut self, snapshot: Snapshot, config: Config, changed_chars: usize) {
@@ -311,7 +336,7 @@ impl State {
         }
     }
 
-    pub(crate) fn close(&mut self) -> Result<()> {
+    pub(crate) fn close(&mut self, keep_recovered: bool) -> Result<Vec<PathBuf>> {
         self.closed = true;
         self.disable();
         if let Some(worker) = self.worker.take() {
@@ -319,9 +344,12 @@ impl State {
         }
         // Abort cannot stop an already-running blocking worker. Swap::close
         // fences it under the same lock and removes whatever it published.
-        self.swap.lock().close()?;
+        let retained = self
+            .swap
+            .lock()
+            .close(keep_recovered || !self.recovered_written)?;
         self.published_path = None;
-        Ok(())
+        Ok(retained)
     }
 }
 
@@ -421,7 +449,7 @@ mod tests {
             "latest"
         );
         assert!(!state.pending());
-        state.close().unwrap();
+        state.close(false).unwrap();
     }
 
     #[tokio::test]
@@ -464,7 +492,7 @@ mod tests {
         assert!(poll_fn(|cx| state.poll(cx)).await.unwrap().is_none());
         assert_eq!(state.path(), Some(path.clone()));
         assert_eq!(super::super::read(&path).unwrap().text.to_string(), "b");
-        state.close().unwrap();
+        state.close(false).unwrap();
     }
 
     #[tokio::test]
@@ -483,7 +511,7 @@ mod tests {
         }
         assert_eq!(super::super::read(&path).unwrap().text.to_string(), "new");
         assert!(!state.pending());
-        state.close().unwrap();
+        state.close(false).unwrap();
     }
 
     #[tokio::test]
@@ -521,7 +549,7 @@ mod tests {
         state.refresh(original, "UTF-8".into(), false, "lf".into(), config);
         assert!(poll_fn(|cx| state.poll(cx)).await.unwrap().is_none());
         assert_eq!(state.path(), Some(path));
-        state.close().unwrap();
+        state.close(false).unwrap();
     }
 
     #[tokio::test]
@@ -534,7 +562,7 @@ mod tests {
         state.record(snapshot.clone(), config.clone(), 200);
         let _ = poll_fn(|cx| state.poll(cx)).now_or_never();
         let swap = state.swap.clone();
-        state.close().unwrap();
+        state.close(false).unwrap();
         assert!(!state.pending());
         assert!(!path.exists());
         assert!(swap

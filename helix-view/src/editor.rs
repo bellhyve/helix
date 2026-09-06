@@ -2114,6 +2114,8 @@ pub struct Editor {
     pub workspace_trust: WorkspaceTrust,
     /// File positions restored from / written to persistent state.
     pub old_file_locs: HashMap<PathBuf, (ViewPosition, Selection)>,
+    /// Retained backup paths, also printed after the terminal is restored on exit.
+    pub retained_recovery_backups: Vec<PathBuf>,
 }
 
 pub type Motion = Box<dyn Fn(&mut Editor)>;
@@ -2244,6 +2246,7 @@ impl Editor {
             dir_stack: VecDeque::with_capacity(DIR_STACK_CAP),
             workspace_trust,
             old_file_locs,
+            retained_recovery_backups: Vec::new(),
         }
     }
 
@@ -3301,8 +3304,10 @@ impl Editor {
         }
 
         let mut doc = self.documents.remove(&doc_id).unwrap();
-        if let Err(error) = doc.recovery.close() {
-            self.set_warning(format!("Recovery file retained: {error:#}"));
+        let keep_recovered = doc.config.load().recovery.keep_recovered;
+        match doc.recovery.close(keep_recovered) {
+            Ok(paths) => self.report_recovery_backups(paths),
+            Err(error) => self.set_warning(format!("Recovery file retained: {error:#}")),
         }
 
         // If the document we removed was visible in all views, we will have no more views. We don't
@@ -3603,9 +3608,47 @@ impl Editor {
 
     /// Only call after a successful intentional exit, never from Drop or a signal handler.
     pub fn close_recovery(&mut self) -> Vec<anyhow::Error> {
-        self.documents_mut()
-            .filter_map(|doc| doc.recovery.close().err())
-            .collect()
+        let results: Vec<_> = self
+            .documents_mut()
+            .map(|doc| {
+                let keep_recovered = doc.config.load().recovery.keep_recovered;
+                doc.recovery.close(keep_recovered)
+            })
+            .collect();
+        let mut errors = Vec::new();
+        for result in results {
+            match result {
+                Ok(paths) => self.report_recovery_backups(paths),
+                Err(error) => errors.push(error),
+            }
+        }
+        errors
+    }
+
+    fn report_recovery_backups(&mut self, paths: Vec<PathBuf>) {
+        // A retained archive may since have been explicitly recovered and consumed.
+        let still_present = |path: &PathBuf| {
+            !matches!(
+                fs::symlink_metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound
+            )
+        };
+        self.retained_recovery_backups.retain(still_present);
+        let paths: Vec<_> = paths
+            .into_iter()
+            .filter(still_present)
+            .filter(|path| !self.retained_recovery_backups.contains(path))
+            .collect();
+        if !paths.is_empty() {
+            self.set_warning(format!(
+                "Recovery backup retained: {}",
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            self.retained_recovery_backups.extend(paths);
+        }
     }
 
     pub async fn wait_event(&mut self) -> EditorEvent {

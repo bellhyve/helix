@@ -11,8 +11,9 @@ pub(crate) use state::State;
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -27,11 +28,14 @@ const VERSION: u32 = 1;
 const MAX_HEADER: usize = 64 * 1024;
 const PREFIX: &str = ".helix-recovery-";
 const TEMP_PREFIX: &str = ".helix-pending-";
+const ARCHIVE_PREFIX: &str = ".helix-recovered-";
+const ARCHIVE_SUFFIX: &str = ".recovered";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Config {
     pub enable: bool,
+    pub keep_recovered: bool,
     pub directories: Vec<PathBuf>,
     /// A filename suffix, not a path. ASCII letters, digits, '.', '_' and '-'.
     #[serde(deserialize_with = "deserialize_suffix")]
@@ -50,10 +54,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enable: false,
-            directories: [".", "~/tmp", "/var/tmp", "/tmp"]
-                .into_iter()
-                .map(PathBuf::from)
-                .collect(),
+            keep_recovered: false,
+            directories: vec![
+                ".".into(),
+                helix_loader::state_dir().join("recovery"),
+                "/var/tmp".into(),
+                "/tmp".into(),
+            ],
             suffix: ".swp".into(),
             size_threshold: 0,
             update_count: 200,
@@ -302,6 +309,54 @@ fn open_regular(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+fn try_lock(file: &File) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        Ok(file.try_lock()?)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY},
+            System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0},
+        };
+
+        // Windows locks deny reads too. Reserve one byte beyond snapshot data
+        // so separate read/discovery handles remain usable while ownership is held.
+        const LOCK_OFFSET: u64 = i64::MAX as u64 - 1;
+        ensure!(
+            file.metadata()?.len() < LOCK_OFFSET,
+            "recovery file reaches reserved lock byte"
+        );
+        let mut overlapped = OVERLAPPED {
+            Anonymous: OVERLAPPED_0 {
+                Anonymous: OVERLAPPED_0_0 {
+                    Offset: LOCK_OFFSET as u32,
+                    OffsetHigh: (LOCK_OFFSET >> 32) as u32,
+                },
+            },
+            ..Default::default()
+        };
+        // SAFETY: File supplies a live readable handle, and OVERLAPPED is initialized.
+        // FAIL_IMMEDIATELY prevents pending I/O from outliving this stack value.
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if locked == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+}
+
 fn read_header(reader: &mut BufReader<File>) -> Result<Header> {
     let mut magic = [0; MAGIC.len()];
     reader.read_exact(&mut magic)?;
@@ -335,29 +390,99 @@ fn read_header(reader: &mut BufReader<File>) -> Result<Header> {
 /// trailing data, and invalid selection offsets. Allocation follows actual
 /// streamed text, never an untrusted declared payload length.
 pub fn read(path: &Path) -> Result<Snapshot> {
-    (|| -> Result<Snapshot> {
-        let mut reader = BufReader::new(open_regular(path)?);
-        let header = read_header(&mut reader)?;
-        let text = Rope::from_reader((&mut reader).take(header.payload_len))?;
-        ensure!(
-            text.len_bytes() as u64 == header.payload_len,
-            "truncated recovery text"
-        );
-        ensure!(reader.read(&mut [0; 1])? == 0, "trailing recovery data");
-        let snapshot = Snapshot {
-            path: header.path.map(StoredPath::decode),
-            cwd: header.cwd.decode(),
-            text,
-            encoding: header.encoding,
-            has_bom: header.has_bom,
-            line_ending: header.line_ending,
-            selections: header.selections,
-            primary: header.primary,
+    open_regular(path)
+        .and_then(|file| decode(&mut BufReader::new(file)).map(|(snapshot, _)| snapshot))
+        .with_context(|| format!("reading recovery file {}", path.display()))
+}
+
+fn decode(reader: &mut BufReader<File>) -> Result<(Snapshot, RecoveryMetadata)> {
+    let header = read_header(reader)?;
+    let metadata = RecoveryMetadata {
+        timestamp: header.timestamp,
+        original_size: header.original_size,
+        original_modified: header.original_modified,
+    };
+    let text = Rope::from_reader((&mut *reader).take(header.payload_len))?;
+    ensure!(
+        text.len_bytes() as u64 == header.payload_len,
+        "truncated recovery text"
+    );
+    ensure!(reader.read(&mut [0; 1])? == 0, "trailing recovery data");
+    let snapshot = Snapshot {
+        path: header.path.map(StoredPath::decode),
+        cwd: header.cwd.decode(),
+        text,
+        encoding: header.encoding,
+        has_bom: header.has_bom,
+        line_ending: header.line_ending,
+        selections: header.selections,
+        primary: header.primary,
+    };
+    snapshot.validate()?;
+    Ok((snapshot, metadata))
+}
+
+/// Saved header metadata. Times are seconds since the Unix epoch.
+#[derive(Clone, Copy, Debug)]
+pub struct RecoveryMetadata {
+    pub timestamp: u64,
+    pub original_size: Option<u64>,
+    pub original_modified: Option<u64>,
+}
+
+/// A decoded snapshot and exclusive ownership of its selected sidefile.
+/// Dropping this claim releases the lock without changing or removing the file.
+pub struct Recovery {
+    pub snapshot: Snapshot,
+    pub metadata: RecoveryMetadata,
+    file: OwnedFile,
+    source_path: Option<PathBuf>,
+    source_cwd: PathBuf,
+    directories: Vec<PathBuf>,
+    suffix: String,
+}
+
+impl Recovery {
+    pub fn path(&self) -> &Path {
+        &self.file.path
+    }
+
+    /// Recheck the selected identity before applying the snapshot to a document.
+    pub(crate) fn check(&self) -> Result<()> {
+        self.file.check()
+    }
+}
+
+/// Claim a sidefile without writing or unlinking anything, preparing adoption
+/// with the current configuration. Fails immediately if another owner holds it.
+/// Older Helix versions do not participate in locking; close them before upgrading.
+pub fn claim(path: &Path, config: &Config) -> Result<Recovery> {
+    (|| -> Result<Recovery> {
+        let path = std::path::absolute(path)?;
+        let file = open_regular(&path)?;
+        try_lock(&file).context("acquiring exclusive recovery file lock")?;
+        let mut reader = BufReader::new(file);
+        let (snapshot, metadata) = decode(&mut reader)?;
+        let file = OwnedFile {
+            path,
+            file: Arc::new(reader.into_inner()),
         };
-        snapshot.validate()?;
-        Ok(snapshot)
+        // Saved v1 paths may be relative. Do not resolve old aliases again.
+        let source_path = snapshot.path.as_ref().map(|path| snapshot.cwd.join(path));
+        let directories = directories(config, source_path.as_deref(), &snapshot.cwd)?;
+        let recovered = Recovery {
+            source_path,
+            source_cwd: snapshot.cwd.clone(),
+            directories,
+            suffix: config.suffix.clone(),
+            snapshot,
+            metadata,
+            file,
+        };
+        recovered.check()?;
+        Ok(recovered)
     })()
-    .with_context(|| format!("reading recovery file {}", path.display()))
+    .with_context(|| format!("claiming recovery file {}", path.display()))
 }
 
 // A new file may not exist yet, and some filesystems cannot represent all native
@@ -488,16 +613,18 @@ fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct OwnedFile {
     path: PathBuf,
-    // Keeping the handle open also prevents inode/file-ID reuse after unlink.
-    identity: Handle,
+    // Shared with pending originals until their independent archive is durable.
+    file: Arc<File>,
 }
 
 impl OwnedFile {
     fn check(&self) -> Result<()> {
         ensure!(
-            Handle::from_file(open_regular(&self.path)?)? == self.identity,
+            Handle::from_file(open_regular(&self.path)?)?
+                == Handle::from_file(self.file.try_clone()?)?,
             "recovery file was replaced: {}",
             self.path.display()
         );
@@ -506,7 +633,10 @@ impl OwnedFile {
 
     fn remove(&self) -> Result<()> {
         match fs::symlink_metadata(&self.path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            // Retry the directory sync after an earlier successful unlink.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return sync_parent(&self.path)
+            }
             result => {
                 result?;
             }
@@ -517,22 +647,46 @@ impl OwnedFile {
     }
 }
 
-/// Only files published by this instance are owned. There is no Drop cleanup.
+struct RecoveredSource {
+    original: Option<OwnedFile>,
+    // Record publication before directory sync, so a sync failure stays owned.
+    archive: Option<OwnedFile>,
+}
+
+/// Owns files published by this instance or explicitly claimed for recovery.
+/// There is no Drop cleanup.
 /// Serialize every write, migration and close using the same external mutex.
 #[derive(Default)]
 pub struct Swap {
     files: Vec<OwnedFile>,
+    recovered: Vec<RecoveredSource>,
+    retained_archives: Vec<PathBuf>,
     source_path: Option<PathBuf>,
     source_cwd: PathBuf,
     directories: Vec<PathBuf>,
     suffix: String,
     last_generation: Option<u64>,
     closed: bool,
+    retain_recovered: bool,
 }
 
 impl Swap {
     pub fn path(&self) -> Option<&Path> {
         self.files.last().map(|file| file.path.as_path())
+    }
+
+    /// Adopt a prepared claim without I/O. The caller ensures this swap is open
+    /// with no pending I/O. Prior owned files remain for normal write/close cleanup.
+    pub(crate) fn adopt(&mut self, recovered: Recovery) {
+        self.source_path = recovered.source_path;
+        self.source_cwd = recovered.source_cwd;
+        self.directories = recovered.directories;
+        self.suffix = recovered.suffix;
+        self.recovered.push(RecoveredSource {
+            original: Some(recovered.file.clone()),
+            archive: None,
+        });
+        self.files.push(recovered.file);
     }
 
     /// Write a full snapshot. Returns None when closed, older than the newest
@@ -577,10 +731,18 @@ impl Swap {
         ensure!(header.len() <= MAX_HEADER, "recovery header exceeds 64 KiB");
         let directories = directories(config, snapshot.path.as_deref(), &snapshot.cwd)?;
         let migrate = self.files.is_empty()
+            || self.path().is_some_and(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(ARCHIVE_PREFIX))
+            })
             || self.source_path != snapshot.path
             || (snapshot.path.is_none() && self.source_cwd != snapshot.cwd)
             || self.directories != directories
             || self.suffix != config.suffix;
+        // Includes earlier adoptions that this write will retire, not just the
+        // selected path. No original may be consumed until every copy is durable.
+        self.archive_recovered()?;
         let published = if migrate {
             let mut errors = Vec::new();
             let mut published = None;
@@ -623,11 +785,99 @@ impl Swap {
         Ok(Some(path))
     }
 
-    /// Permanently fence writes before cleanup, even when removal fails. Calling
-    /// close again retries cleanup; it never unlinks a replaced file or symlink.
-    pub fn close(&mut self) -> Result<()> {
+    /// Fence writes before cleanup. The first call fixes the retention policy;
+    /// retries cannot delete archives selected for retention. Callers may pass
+    /// false only after a successful recovered-buffer write and intentional close.
+    /// Success releases all ownership locks and returns retained archive paths.
+    pub fn close(&mut self, retain_recovered: bool) -> Result<Vec<PathBuf>> {
+        if !self.closed {
+            self.retain_recovered = retain_recovered;
+        }
         self.closed = true;
-        self.remove_files(false)
+        let cleanup = (|| -> Result<()> {
+            if self.retain_recovered {
+                self.archive_recovered()?;
+            }
+            self.remove_files(false)?;
+            for index in (0..self.recovered.len()).rev() {
+                if let Some(archive) = &self.recovered[index].archive {
+                    if self.retain_recovered {
+                        self.retained_archives.push(archive.path.clone());
+                    } else {
+                        archive.remove()?;
+                    }
+                }
+                self.recovered.remove(index);
+            }
+            Ok(())
+        })();
+        if let Err(error) = cleanup {
+            let paths: Vec<_> = self
+                .recovered
+                .iter()
+                .filter_map(|backup| backup.archive.as_ref())
+                .map(|archive| &archive.path)
+                .chain(self.retained_archives.iter())
+                .map(|path| path.display().to_string())
+                .collect();
+            return Err(if paths.is_empty() {
+                error
+            } else {
+                error.context(format!(
+                    "Recovery backup paths after incomplete cleanup: {}",
+                    paths.join(", ")
+                ))
+            });
+        }
+        Ok(self.retained_archives.clone())
+    }
+
+    fn archive_recovered(&mut self) -> Result<()> {
+        for recovered in &mut self.recovered {
+            let Some(original) = &recovered.original else {
+                recovered.archive.as_ref().unwrap().check()?;
+                continue;
+            };
+            if recovered.archive.is_none() {
+                original.check()?;
+                let directory = original
+                    .path
+                    .parent()
+                    .context("recovery file has no parent")?;
+                let mut builder = Builder::new();
+                builder
+                    .prefix(TEMP_PREFIX)
+                    .suffix(ARCHIVE_SUFFIX)
+                    .rand_bytes(16);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    builder.permissions(fs::Permissions::from_mode(0o600));
+                }
+                let mut temporary = builder.tempfile_in(directory)?;
+                // Serialized by the Swap mutex. The original reader is no longer
+                // used, so sharing its cursor through Arc<File> is harmless.
+                let mut source = original.file.as_ref();
+                source.rewind()?;
+                let length = source.metadata()?.len();
+                ensure!(
+                    io::copy(&mut source, temporary.as_file_mut())? == length,
+                    "recovered original changed length while archiving"
+                );
+                temporary.as_file().sync_all()?;
+                original.check()?;
+                let name = temporary.path().file_name().unwrap().to_str().unwrap();
+                let destination =
+                    directory.join(format!("{ARCHIVE_PREFIX}{}", &name[TEMP_PREFIX.len()..]));
+                recovered.archive = Some(publish(temporary, destination, None)?);
+            }
+            let archive = recovered.archive.as_ref().unwrap();
+            archive.check()?;
+            sync_parent(&archive.path)
+                .with_context(|| format!("syncing recovered archive {}", archive.path.display()))?;
+            recovered.original = None;
+        }
+        Ok(())
     }
 
     fn remove_files(&mut self, keep_last: bool) -> Result<()> {
@@ -658,6 +908,7 @@ fn stage(
     config: &Config,
     header: &[u8],
 ) -> Result<NamedTempFile> {
+    prepare_directory(directory, &helix_loader::state_dir().join("recovery"))?;
     let description: String = snapshot
         .path
         .as_deref()
@@ -698,12 +949,39 @@ fn stage(
     Ok(temporary)
 }
 
+// Only the app-owned state directory may be created automatically. The explicit
+// argument also lets tests exercise creation without touching the user's state.
+fn prepare_directory(directory: &Path, state_directory: &Path) -> Result<()> {
+    if directory != state_directory {
+        return Ok(());
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(directory)?;
+    // An earlier attempt may have created directories but failed to sync them.
+    // Re-sync the ancestor entries rather than treating existence as durability.
+    for path in directory
+        .ancestors()
+        .take_while(|path| path.parent().is_some())
+    {
+        sync_parent(path)?;
+    }
+    Ok(())
+}
+
 fn publish(
     temporary: NamedTempFile,
     path: PathBuf,
     previous: Option<&OwnedFile>,
 ) -> Result<OwnedFile> {
-    let identity = Handle::from_file(temporary.as_file().try_clone()?)?;
+    try_lock(temporary.as_file()).context("acquiring exclusive recovery temporary file lock")?;
+    let file = Arc::new(temporary.as_file().try_clone()?);
+    let identity = Handle::from_file(file.try_clone()?)?;
     ensure!(
         Handle::from_file(open_regular(temporary.path())?)? == identity,
         "recovery temporary file was replaced"
@@ -716,7 +994,7 @@ fn publish(
             .persist_noclobber(&path)
             .map_err(|error| error.error)?;
     }
-    Ok(OwnedFile { path, identity })
+    Ok(OwnedFile { path, file })
 }
 
 #[cfg(test)]
@@ -773,10 +1051,567 @@ mod tests {
     }
 
     #[test]
+    fn claim_adopts_selected_file_without_writes() {
+        for named in [false, true] {
+            let root = TempDir::new().unwrap();
+            let mut state = snapshot(root.path());
+            if !named {
+                state.path = None;
+            }
+            let mut conf = config(root.path());
+            let selected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+            let unselected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+            let bytes = fs::read(&selected).unwrap();
+            let unselected_bytes = fs::read(&unselected).unwrap();
+            // Adoption uses today's settings, not the selected file's old location/suffix.
+            conf.directories = vec![".".into(), root.path().join("unavailable")];
+            conf.suffix = ".new-suffix".into();
+            let recovered = claim(&selected, &conf).unwrap();
+            assert_eq!(recovered.path(), selected);
+            assert_snapshot(&recovered.snapshot, &state);
+            recovered.check().unwrap();
+            assert!(claim(&selected, &conf).is_err());
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+            drop(recovered);
+            assert_eq!(fs::read(&selected).unwrap(), bytes);
+
+            let recovered = claim(&selected, &conf).unwrap();
+            let mut state = recovered.snapshot.clone();
+            let mut swap = Swap::default();
+            swap.adopt(recovered);
+            assert_eq!(swap.path(), Some(selected.as_path()));
+            assert!(claim(&selected, &conf).is_err());
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+            drop(swap);
+            assert_eq!(fs::read(&selected).unwrap(), bytes);
+
+            let mut swap = Swap::default();
+            swap.adopt(claim(&selected, &conf).unwrap());
+            state.text.append(Rope::from_str("recovered edit"));
+            assert_eq!(
+                swap.write(&state, &conf, 2).unwrap(),
+                Some(selected.clone())
+            );
+            assert!(claim(&selected, &conf).is_err());
+            let archive = swap.recovered[0].archive.as_ref().unwrap().path.clone();
+            drop(swap);
+            assert_snapshot(&read(&selected).unwrap(), &state);
+            assert_eq!(fs::read(&archive).unwrap(), bytes);
+            assert!(claim(&archive, &conf).is_ok());
+
+            let mut swap = Swap::default();
+            swap.adopt(claim(&selected, &conf).unwrap());
+            swap.close(false).unwrap();
+            assert!(!selected.exists());
+            assert_eq!(fs::read(&archive).unwrap(), bytes);
+            assert_eq!(fs::read(&unselected).unwrap(), unselected_bytes);
+        }
+    }
+
+    #[test]
+    fn adoption_retains_prior_files_until_preservation_or_close() {
+        for preserve in [false, true] {
+            let root = TempDir::new().unwrap();
+            let state = snapshot(root.path());
+            let conf = config(root.path());
+            let selected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+            let mut target = Swap::default();
+            let prior = target.write(&state, &conf, 10).unwrap().unwrap();
+            let recovered = claim(&selected, &conf).unwrap();
+            let state = recovered.snapshot.clone();
+            target.adopt(recovered);
+            assert_eq!(target.last_generation, Some(10));
+            assert_eq!(target.path(), Some(selected.as_path()));
+            assert_eq!(target.files.len(), 2);
+            assert!(prior.exists());
+            assert!(claim(&prior, &conf).is_err());
+            assert!(claim(&selected, &conf).is_err());
+            if preserve {
+                assert_eq!(
+                    target.write(&state, &conf, 11).unwrap(),
+                    Some(selected.clone())
+                );
+                assert!(!prior.exists());
+                assert_eq!(target.files.len(), 1);
+            }
+            target.close(false).unwrap();
+            assert!(!prior.exists());
+            assert!(!selected.exists());
+        }
+    }
+
+    #[test]
+    fn recovered_original_is_immutable_across_active_writes() {
+        for retain in [false, true] {
+            let root = TempDir::new().unwrap();
+            let mut state = snapshot(root.path());
+            let conf = config(root.path());
+            let selected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+            // A historical timestamp and Value's different JSON key order make
+            // decoding and re-encoding insufficient for an exact original copy.
+            let mut header =
+                serde_json::to_value(Header::new(&read(&selected).unwrap()).unwrap()).unwrap();
+            header["timestamp"] = serde_json::json!(1234);
+            raw_file(&selected, &header, state.text.to_string().as_bytes());
+            let bytes = fs::read(&selected).unwrap();
+            let identity = Handle::from_file(open_regular(&selected).unwrap()).unwrap();
+            let mut swap = Swap::default();
+            swap.adopt(claim(&selected, &conf).unwrap());
+            let encoding = state.encoding.clone();
+            state.encoding = "x".repeat(MAX_HEADER);
+            assert!(swap.write(&state, &conf, 2).is_err());
+            assert_eq!(fs::read(&selected).unwrap(), bytes);
+            assert!(swap.recovered[0].archive.is_none());
+            state.encoding = encoding;
+            let mut archives = Vec::new();
+            for generation in 2..5 {
+                state.text.append(Rope::from_str("new edit"));
+                assert_eq!(
+                    swap.write(&state, &conf, generation).unwrap(),
+                    Some(selected.clone())
+                );
+                assert_snapshot(&read(&selected).unwrap(), &state);
+                assert_eq!(swap.recovered.len(), 1);
+                let archive = swap.recovered[0].archive.as_ref().unwrap();
+                assert!(swap.recovered[0].original.is_none());
+                assert_eq!(fs::read(&archive.path).unwrap(), bytes);
+                assert_ne!(
+                    Handle::from_file(open_regular(&archive.path).unwrap()).unwrap(),
+                    identity
+                );
+                assert!(claim(&archive.path, &conf).is_err());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        archive.file.metadata().unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                }
+                if archives.is_empty() {
+                    archives.push(archive.path.clone());
+                }
+                assert_eq!(archives, vec![archive.path.clone()]);
+                assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+            }
+            let retained = swap.close(retain).unwrap();
+            assert!(!selected.exists());
+            if retain {
+                assert_eq!(retained, archives);
+                assert_eq!(fs::read(&retained[0]).unwrap(), bytes);
+                assert!(claim(&retained[0], &conf).is_ok());
+                assert_eq!(swap.close(false).unwrap(), retained);
+            } else {
+                assert!(retained.is_empty());
+                assert!(!archives[0].exists());
+                assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn retained_close_preserves_all_adoptions_and_leaves_unselected_untouched() {
+        for preserve in [false, true] {
+            let root = TempDir::new().unwrap();
+            let mut state = snapshot(root.path());
+            let conf = config(root.path());
+            let first = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+            let first_bytes = fs::read(&first).unwrap();
+            state.text.append(Rope::from_str("second original"));
+            let second = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+            let second_bytes = fs::read(&second).unwrap();
+            let unselected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+            let mut swap = Swap::default();
+            let prior = swap.write(&state, &conf, 1).unwrap().unwrap();
+            swap.adopt(claim(&first, &conf).unwrap());
+            swap.adopt(claim(&second, &conf).unwrap());
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 4);
+            if preserve {
+                state.text.append(Rope::from_str("active update"));
+                assert_eq!(swap.write(&state, &conf, 2).unwrap(), Some(second.clone()));
+                assert!(!first.exists());
+            }
+            let archives = swap.close(true).unwrap();
+            assert_eq!(archives.len(), 2);
+            let archived_bytes: Vec<_> = archives
+                .iter()
+                .map(|path| fs::read(path).unwrap())
+                .collect();
+            assert!(archived_bytes.contains(&first_bytes));
+            assert!(archived_bytes.contains(&second_bytes));
+            assert!(!first.exists() && !second.exists() && !prior.exists());
+            assert_eq!(fs::read(&unselected).unwrap(), second_bytes);
+            for archive in &archives {
+                assert!(claim(archive, &conf).is_ok());
+            }
+            assert_eq!(swap.close(false).unwrap(), archives);
+            assert!(swap.write(&state, &conf, 3).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn archives_are_explicit_only_and_recovery_publishes_a_new_active_name() {
+        let root = TempDir::new().unwrap();
+        let mut state = snapshot(root.path());
+        let conf = config(root.path());
+        let selected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+        let bytes = fs::read(&selected).unwrap();
+        let mut swap = Swap::default();
+        swap.adopt(claim(&selected, &conf).unwrap());
+        let archive = swap.close(true).unwrap().pop().unwrap();
+        assert!(archive
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with(ARCHIVE_PREFIX));
+        assert!(archive.to_str().unwrap().ends_with(ARCHIVE_SUFFIX));
+        for suffix in [".swp", ARCHIVE_SUFFIX] {
+            let conf = Config {
+                suffix: suffix.into(),
+                ..conf.clone()
+            };
+            assert!(discover(&conf, state.path.as_deref(), &state.cwd)
+                .unwrap()
+                .candidates
+                .is_empty());
+        }
+        let recovered = claim(&archive, &conf).unwrap();
+        assert_snapshot(&recovered.snapshot, &state);
+        let mut swap = Swap::default();
+        swap.adopt(recovered);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        state.text.append(Rope::from_str("archive recovery edit"));
+        let active = swap.write(&state, &conf, 2).unwrap().unwrap();
+        assert_ne!(active, archive);
+        assert!(active
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with(PREFIX));
+        assert!(!archive.exists());
+        assert_eq!(
+            discover(&conf, state.path.as_deref(), &state.cwd)
+                .unwrap()
+                .candidates,
+            vec![active.clone()]
+        );
+        assert_snapshot(&read(&active).unwrap(), &state);
+        let new_archive = swap.close(true).unwrap().pop().unwrap();
+        assert_ne!(new_archive, archive);
+        assert_eq!(new_archive.parent(), archive.parent());
+        assert_eq!(fs::read(&new_archive).unwrap(), bytes);
+        assert!(claim(&new_archive, &conf).is_ok());
+        assert!(!active.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_copy_failure_fences_close_and_keeps_originals_for_retry() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = TempDir::new().unwrap();
+        // Root bypasses directory write permission checks.
+        if root.path().metadata().unwrap().uid() == 0 {
+            return;
+        }
+        let state = snapshot(root.path());
+        let conf = config(root.path());
+        let selected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+        let bytes = fs::read(&selected).unwrap();
+        let mut swap = Swap::default();
+        let prior = swap.write(&state, &conf, 1).unwrap().unwrap();
+        let prior_bytes = fs::read(&prior).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        swap.adopt(claim(&selected, &conf).unwrap());
+        let write = swap.write(&state, &conf, 2);
+        let close = swap.close(true);
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(write.is_err() && close.is_err());
+        assert!(swap.recovered[0].archive.is_none());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+        assert_eq!(fs::read(&selected).unwrap(), bytes);
+        assert_eq!(fs::read(&prior).unwrap(), prior_bytes);
+        assert!(swap.write(&state, &conf, 3).unwrap().is_none());
+        // A changed retry argument must not discard the retention decision.
+        let archives = swap.close(false).unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(fs::read(&archives[0]).unwrap(), bytes);
+        assert!(!selected.exists() && !prior.exists());
+        assert!(claim(&archives[0], &conf).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_directory_sync_failure_retains_both_files_and_retries_publication() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        for close in [false, true] {
+            let root = TempDir::new().unwrap();
+            if root.path().metadata().unwrap().uid() == 0 {
+                return;
+            }
+            let mut state = snapshot(root.path());
+            let conf = config(root.path());
+            let selected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+            let bytes = fs::read(&selected).unwrap();
+            let mut swap = Swap::default();
+            swap.adopt(claim(&selected, &conf).unwrap());
+            state.text.append(Rope::from_str("edited snapshot"));
+            // Write+execute permits copying and publishing, but opening the
+            // directory for fsync requires read permission.
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o300)).unwrap();
+            let result = if close {
+                swap.close(true).map(|_| ())
+            } else {
+                swap.write(&state, &conf, 2).map(|_| ())
+            };
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(result.is_err());
+            let archive = swap.recovered[0].archive.as_ref().unwrap().path.clone();
+            assert!(swap.recovered[0].original.is_some());
+            assert_eq!(fs::read(&selected).unwrap(), bytes);
+            assert_eq!(fs::read(&archive).unwrap(), bytes);
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+            assert!(claim(&selected, &conf).is_err());
+            assert!(claim(&archive, &conf).is_err());
+            let retained = if close {
+                swap.close(false).unwrap()
+            } else {
+                assert_eq!(
+                    swap.write(&state, &conf, 2).unwrap(),
+                    Some(selected.clone())
+                );
+                assert!(swap.recovered[0].original.is_none());
+                assert_snapshot(&read(&selected).unwrap(), &state);
+                swap.close(true).unwrap()
+            };
+            assert_eq!(retained, vec![archive.clone()]);
+            assert_eq!(fs::read(&archive).unwrap(), bytes);
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+            assert!(claim(&archive, &conf).is_ok());
+            assert!(!selected.exists());
+        }
+    }
+
+    #[test]
+    fn replaced_original_blocks_archiving_and_retained_cleanup() {
+        let root = TempDir::new().unwrap();
+        let state = snapshot(root.path());
+        let conf = config(root.path());
+        let selected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+        let bytes = fs::read(&selected).unwrap();
+        let mut swap = Swap::default();
+        let prior = swap.write(&state, &conf, 1).unwrap().unwrap();
+        swap.adopt(claim(&selected, &conf).unwrap());
+        let moved = root.path().join("moved-original");
+        fs::rename(&selected, &moved).unwrap();
+        fs::write(&selected, b"stranger").unwrap();
+        assert!(swap.write(&state, &conf, 2).is_err());
+        assert!(swap.close(true).is_err());
+        assert!(swap.recovered[0].archive.is_none());
+        assert!(prior.exists());
+        assert_eq!(fs::read(&moved).unwrap(), bytes);
+        assert_eq!(fs::read(&selected).unwrap(), b"stranger");
+        fs::remove_file(&selected).unwrap();
+        fs::rename(&moved, &selected).unwrap();
+        let archives = swap.close(false).unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(fs::read(&archives[0]).unwrap(), bytes);
+        assert!(!selected.exists() && !prior.exists());
+    }
+
+    #[test]
+    fn retained_archives_survive_cleanup_failure_and_retry() {
+        let root = TempDir::new().unwrap();
+        let state = snapshot(root.path());
+        let conf = config(root.path());
+        let selected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+        let bytes = fs::read(&selected).unwrap();
+        let mut swap = Swap::default();
+        swap.adopt(claim(&selected, &conf).unwrap());
+        swap.write(&state, &conf, 2).unwrap();
+        let archive = swap.recovered[0].archive.as_ref().unwrap().path.clone();
+        let moved_archive = root.path().join("moved-archive");
+        fs::rename(&archive, &moved_archive).unwrap();
+        fs::write(&archive, b"stranger archive").unwrap();
+        assert!(swap.write(&state, &conf, 3).is_err());
+        assert!(swap.close(true).is_err());
+        assert!(selected.exists());
+        assert_eq!(fs::read(&archive).unwrap(), b"stranger archive");
+        assert_eq!(fs::read(&moved_archive).unwrap(), bytes);
+        fs::remove_file(&archive).unwrap();
+        fs::rename(&moved_archive, &archive).unwrap();
+        let moved = root.path().join("moved-active");
+        fs::rename(&selected, &moved).unwrap();
+        fs::write(&selected, b"stranger").unwrap();
+        assert!(swap.close(true).is_err());
+        assert_eq!(fs::read(&archive).unwrap(), bytes);
+        assert_eq!(fs::read(&selected).unwrap(), b"stranger");
+        fs::remove_file(&selected).unwrap();
+        fs::rename(&moved, &selected).unwrap();
+        assert_eq!(swap.close(false).unwrap(), vec![archive.clone()]);
+        assert!(claim(&archive, &conf).is_ok());
+        assert!(!selected.exists());
+    }
+
+    #[test]
+    fn locks_survive_publication_and_replacement() {
+        let root = TempDir::new().unwrap();
+        let state = snapshot(root.path());
+        let conf = config(root.path());
+        let mut swap = Swap::default();
+        let path = swap.write(&state, &conf, 1).unwrap().unwrap();
+        for generation in 2..5 {
+            assert!(claim(&path, &conf).is_err());
+            // A reader opened before replacement must not claim the stale inode.
+            let stale = open_regular(&path).unwrap();
+            assert_eq!(
+                swap.write(&state, &conf, generation).unwrap(),
+                Some(path.clone())
+            );
+            assert!(claim(&path, &conf).is_err());
+            try_lock(&stale).unwrap();
+            let mut reader = BufReader::new(stale);
+            assert_snapshot(&decode(&mut reader).unwrap().0, &state);
+            let stale = OwnedFile {
+                path: path.clone(),
+                file: Arc::new(reader.into_inner()),
+            };
+            assert!(stale.check().is_err());
+            assert!(stale.remove().is_err());
+            assert!(path.exists());
+        }
+        // Publication must not release the old lock before Swap updates ownership.
+        let old = open_regular(&path).unwrap();
+        let header = serde_json::to_vec(&Header::new(&state).unwrap()).unwrap();
+        let temporary = stage(root.path(), &state, &conf, &header).unwrap();
+        let published = publish(temporary, path.clone(), swap.files.last()).unwrap();
+        assert!(try_lock(&old).is_err());
+        assert!(claim(&path, &conf).is_err());
+        swap.files.pop();
+        try_lock(&old).unwrap();
+        swap.files.push(published);
+        drop(swap);
+        let recovered = claim(&path, &conf).unwrap();
+        assert!(claim(&path, &conf).is_err());
+        drop(recovered);
+        assert!(claim(&path, &conf).is_ok());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn failed_claim_or_identity_check_never_unlinks() {
+        let root = TempDir::new().unwrap();
+        let state = snapshot(root.path());
+        let conf = config(root.path());
+        let path = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let invalid = Config {
+            suffix: "../unsafe".into(),
+            ..conf.clone()
+        };
+        assert!(claim(&path, &invalid).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let recovered = claim(&path, &conf).unwrap();
+        let moved = root.path().join("moved");
+        fs::rename(&path, &moved).unwrap();
+        fs::write(&path, b"corrupt").unwrap();
+        assert!(recovered.check().is_err());
+        assert!(claim(&path, &conf).is_err());
+        drop(recovered);
+        assert_eq!(fs::read(&path).unwrap(), b"corrupt");
+        assert_eq!(fs::read(&moved).unwrap(), bytes);
+        assert!(claim(&moved, &conf).is_ok());
+    }
+
+    #[test]
+    fn claim_accepts_v1_relative_saved_paths() {
+        let root = TempDir::new().unwrap();
+        let mut state = snapshot(root.path());
+        state.path = Some("example.txt".into());
+        let path = root.path().join("legacy.swp");
+        let mut header = serde_json::to_value(Header::new(&state).unwrap()).unwrap();
+        header["timestamp"] = serde_json::json!(1234);
+        header["original_size"] = serde_json::json!(5678);
+        header["original_modified"] = serde_json::json!(9012);
+        assert_eq!(header["version"], 1);
+        raw_file(&path, &header, state.text.to_string().as_bytes());
+        let conf = Config {
+            enable: false,
+            directories: vec![".".into()],
+            ..config(root.path())
+        };
+        let recovered = claim(&path, &conf).unwrap();
+        assert_eq!(recovered.metadata.timestamp, 1234);
+        assert_eq!(recovered.metadata.original_size, Some(5678));
+        assert_eq!(recovered.metadata.original_modified, Some(9012));
+        assert_eq!(recovered.snapshot.path, state.path);
+        assert_eq!(recovered.source_path, Some(root.path().join("example.txt")));
+        assert_eq!(recovered.source_cwd, state.cwd);
+        assert_eq!(recovered.directories, vec![root.path().to_owned()]);
+        assert_eq!(recovered.snapshot.text, state.text);
+        drop(recovered);
+        assert_eq!(read(&path).unwrap().path, state.path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claim_keeps_saved_identity_after_alias_retargeting() {
+        use std::os::unix::fs::symlink;
+        let root = TempDir::new().unwrap();
+        let mut state = snapshot(root.path());
+        let alias = root.path().join("alias");
+        symlink(state.path.as_ref().unwrap(), &alias).unwrap();
+        state.path = Some(alias.clone());
+        let conf = Config {
+            directories: vec![".".into()],
+            ..config(root.path())
+        };
+        let path = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+        let saved = read(&path).unwrap();
+        fs::remove_file(&alias).unwrap();
+        symlink(root.path().join("different.txt"), &alias).unwrap();
+        let recovered = claim(&path, &conf).unwrap();
+        assert_eq!(recovered.snapshot.path, saved.path);
+        assert_eq!(recovered.source_path, saved.path);
+        let mut swap = Swap::default();
+        swap.adopt(recovered);
+        assert_eq!(swap.write(&saved, &conf, 2).unwrap(), Some(path.clone()));
+        swap.close(false).unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read_link(alias).unwrap(),
+            root.path().join("different.txt")
+        );
+        // Older v1 headers can contain an alias itself; retain it verbatim too.
+        let legacy = root.path().join("legacy.swp");
+        let header = serde_json::to_value(Header::new(&state).unwrap()).unwrap();
+        raw_file(&legacy, &header, state.text.to_string().as_bytes());
+        let recovered = claim(&legacy, &conf).unwrap();
+        assert_eq!(recovered.snapshot.path, state.path);
+        assert_eq!(recovered.source_path, state.path);
+    }
+
+    #[test]
     fn config_defaults_and_validation() {
         let defaults: Config = serde_json::from_str("{}").unwrap();
         assert!(!defaults.enable);
+        assert!(!defaults.keep_recovered);
+        assert!(
+            serde_json::from_str::<Config>(r#"{"keep-recovered":true}"#)
+                .unwrap()
+                .keep_recovered
+        );
         assert_eq!(defaults.directories, Config::default().directories);
+        assert_eq!(
+            defaults.directories,
+            vec![
+                PathBuf::from("."),
+                helix_loader::state_dir().join("recovery"),
+                PathBuf::from("/var/tmp"),
+                PathBuf::from("/tmp"),
+            ]
+        );
         assert_eq!(
             (
                 defaults.update_count,
@@ -909,6 +1744,50 @@ mod tests {
     }
 
     #[test]
+    fn state_directory_creation_is_private_and_write_only() {
+        let root = TempDir::new().unwrap();
+        let directory = root.path().join("state/helix/recovery");
+        let arbitrary = root.path().join("arbitrary");
+        let conf = config(&directory);
+        let state = snapshot(root.path());
+        assert!(discover(&conf, state.path.as_deref(), &state.cwd)
+            .unwrap()
+            .candidates
+            .is_empty());
+        let selected = Swap::default()
+            .write(&state, &config(root.path()), 1)
+            .unwrap()
+            .unwrap();
+        let mut swap = Swap::default();
+        swap.adopt(claim(&selected, &conf).unwrap());
+        assert!(!directory.exists());
+        prepare_directory(&arbitrary, &directory).unwrap();
+        assert!(Swap::default()
+            .write(&state, &config(&arbitrary), 1)
+            .is_err());
+        assert!(!arbitrary.exists());
+        // Inject the app-owned location only into the creation helper, without
+        // changing process-global environment or using the real state directory.
+        prepare_directory(&directory, &directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [
+                &directory,
+                &root.path().join("state/helix"),
+                &root.path().join("state"),
+            ] {
+                assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o700);
+            }
+        }
+        let path = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+        assert_eq!(path.parent(), Some(directory.as_path()));
+        assert_snapshot(&read(&path).unwrap(), &state);
+        assert!(!arbitrary.exists());
+        swap.close(false).unwrap();
+    }
+
+    #[test]
     fn unique_names_and_no_clobber() {
         let root = TempDir::new().unwrap();
         let state = snapshot(root.path());
@@ -1021,7 +1900,7 @@ mod tests {
         conf.directories = vec![root.path().join("unavailable")];
         assert!(swap.write(&state, &conf, 6).is_err());
         assert!(read(&renamed).is_ok());
-        swap.close().unwrap();
+        swap.close(false).unwrap();
     }
 
     #[test]
@@ -1039,7 +1918,7 @@ mod tests {
         assert_ne!(old, new);
         assert_snapshot(&read(&new).unwrap(), &state);
         assert_eq!(swap.files.len(), 2);
-        assert!(swap.close().is_err());
+        assert!(swap.close(false).is_err());
         assert!(!new.exists());
         assert_eq!(fs::read_to_string(old).unwrap(), "stranger");
         assert!(swap.write(&state, &conf, 3).unwrap().is_none());
@@ -1090,14 +1969,14 @@ mod tests {
         assert!(path.exists());
         let mut swap = Swap::default();
         let owned = swap.write(&state, &conf, 1).unwrap().unwrap();
-        swap.close().unwrap();
-        swap.close().unwrap();
+        swap.close(false).unwrap();
+        swap.close(false).unwrap();
         assert!(!owned.exists());
         assert!(path.exists());
         assert!(swap.path().is_none());
         assert!(swap.write(&state, &conf, u64::MAX).unwrap().is_none());
         let mut closed = Swap::default();
-        closed.close().unwrap();
+        closed.close(false).unwrap();
         assert!(closed.write(&state, &conf, 1).unwrap().is_none());
     }
 
@@ -1203,7 +2082,7 @@ mod tests {
         fs::rename(&path, root.path().join("saved-original")).unwrap();
         fs::write(&path, "stranger").unwrap();
         assert!(swap.write(&state, &conf, 2).is_err());
-        assert!(swap.close().is_err());
+        assert!(swap.close(false).is_err());
         assert!(swap.write(&state, &conf, 3).unwrap().is_none());
         assert_eq!(fs::read_to_string(path).unwrap(), "stranger");
     }
@@ -1320,7 +2199,29 @@ mod tests {
         }
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_snapshot(&read(&path).unwrap(), &state);
-        swap.close().unwrap();
+        swap.close(false).unwrap();
+    }
+
+    #[test]
+    fn incomplete_cleanup_reports_the_surviving_original_archive() {
+        let root = TempDir::new().unwrap();
+        let conf = config(root.path());
+        let state = snapshot(root.path());
+        let mut owner = Swap::default();
+        let previous = owner.write(&state, &conf, 1).unwrap().unwrap();
+        let selected = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
+        let original = fs::read(&selected).unwrap();
+        owner.adopt(claim(&selected, &conf).unwrap());
+        fs::remove_file(&previous).unwrap();
+        fs::write(&previous, "replacement that must not be removed").unwrap();
+        let error = owner.close(true).unwrap_err();
+        let archive = owner.recovered[0].archive.as_ref().unwrap().path.clone();
+        assert!(error.to_string().contains(archive.to_str().unwrap()));
+        assert_eq!(fs::read(&archive).unwrap(), original);
+        assert!(!selected.exists());
+        assert!(previous.exists());
+        drop(owner);
+        assert!(claim(&archive, &conf).is_ok());
     }
 
     #[cfg(unix)]
@@ -1363,7 +2264,7 @@ mod tests {
         fs::write(&stranger, "untouched").unwrap();
         symlink(&stranger, &path).unwrap();
         assert!(swap.write(&state, &conf, 2).is_err());
-        assert!(swap.close().is_err());
+        assert!(swap.close(false).is_err());
         assert!(swap.write(&state, &conf, 3).unwrap().is_none());
         assert!(fs::symlink_metadata(&path)
             .unwrap()
@@ -1387,6 +2288,34 @@ mod tests {
         let path = Swap::default().write(&state, &conf, 1).unwrap().unwrap();
         assert_snapshot(&read(&path).unwrap(), &state);
         assert_eq!(discover(&conf, None, &cwd).unwrap().candidates, vec![path]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_live_swaps_remain_readable_and_discoverable() {
+        let root = TempDir::new().unwrap();
+        let state = snapshot(root.path());
+        let conf = config(root.path());
+        let mut swap = Swap::default();
+        let path = swap.write(&state, &conf, 1).unwrap().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_snapshot(&read(&path).unwrap(), &state);
+        let found = discover(&conf, state.path.as_deref(), &state.cwd).unwrap();
+        assert_eq!(found.candidates, vec![path.clone()]);
+        assert!(found.warnings.is_empty());
+        assert!(claim(&path, &conf).is_err());
+        drop(swap);
+
+        // Claim opens read-only; it must still acquire exclusive ownership.
+        let recovered = claim(&path, &conf).unwrap();
+        assert!(claim(&path, &conf).is_err());
+        assert_snapshot(&read(&path).unwrap(), &state);
+        let found = discover(&conf, state.path.as_deref(), &state.cwd).unwrap();
+        assert_eq!(found.candidates, vec![path.clone()]);
+        assert!(found.warnings.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        drop(recovered);
+        assert!(claim(&path, &conf).is_ok());
     }
 
     #[cfg(windows)]
