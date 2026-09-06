@@ -2,7 +2,8 @@ use crate::{
     annotations::diagnostics::{DiagnosticFilter, InlineDiagnosticsConfig},
     clipboard::ClipboardProvider,
     document::{
-        DocumentOpenError, DocumentSavedEventFuture, DocumentSavedEventResult, Mode, SavePoint,
+        DocumentOpenError, DocumentSavedEvent, DocumentSavedEventFuture, DocumentSavedEventResult,
+        Mode, SavePoint,
     },
     events::{DocumentDidClose, DocumentDidOpen, DocumentFocusLost},
     graphics::{CursorKind, Rect},
@@ -10,6 +11,7 @@ use crate::{
     info::Info,
     input::KeyEvent,
     persistence::{self, FileHistoryEntry},
+    recovery,
     regex::EqRegex,
     register::Registers,
     theme::{self, Theme},
@@ -421,6 +423,8 @@ pub struct Config {
     /// Time delay defaults to false with 3000ms delay. Focus lost defaults to false.
     #[serde(deserialize_with = "deserialize_auto_save")]
     pub auto_save: AutoSave,
+    /// Opt-in, full-buffer crash recovery sidefiles.
+    pub recovery: recovery::Config,
     /// Automatic reload of the modified documents on a periodic time interval and/or when the editor gains focus.
     /// Time interval defaults to false with 3000ms delay. Focus gained defaults to false.
     #[serde(deserialize_with = "deserialize_auto_reload")]
@@ -1809,6 +1813,7 @@ impl Default for Config {
             auto_format: true,
             default_yank_register: '"',
             auto_save: AutoSave::default(),
+            recovery: recovery::Config::default(),
             auto_reload: AutoReload::default(),
             idle_timeout: Duration::from_millis(250),
             completion_timeout: Duration::from_millis(250),
@@ -2041,6 +2046,9 @@ pub struct Editor {
     // https://stackoverflow.com/a/66875668
     pub saves: HashMap<DocumentId, UnboundedSender<Once<DocumentSavedEventFuture>>>,
     pub save_queue: SelectAll<Flatten<UnboundedReceiverStream<Once<DocumentSavedEventFuture>>>>,
+    recovery_checks: futures_util::stream::FuturesUnordered<
+        tokio::task::JoinHandle<(DocumentId, anyhow::Result<recovery::Discovery>)>,
+    >,
     pub write_count: usize,
 
     pub count: Option<std::num::NonZeroUsize>,
@@ -2113,6 +2121,7 @@ pub type Motion = Box<dyn Fn(&mut Editor)>;
 #[derive(Debug)]
 pub enum EditorEvent {
     DocumentSaved(DocumentSavedEventResult),
+    Recovery(anyhow::Result<Option<String>>),
     ConfigEvent(ConfigEvent),
     LanguageServerMessage((LanguageServerId, Call)),
     DebuggerEvent((DebugAdapterId, dap::Payload)),
@@ -2196,6 +2205,7 @@ impl Editor {
             documents: BTreeMap::new(),
             saves: HashMap::new(),
             save_queue: SelectAll::new(),
+            recovery_checks: Default::default(),
             write_count: 0,
             count: None,
             selected_register: None,
@@ -2273,6 +2283,12 @@ impl Editor {
     /// relevant members.
     pub fn refresh_config(&mut self, old_config: &Config) {
         let config = self.config();
+        if old_config.recovery != config.recovery {
+            let recovery = config.recovery.clone();
+            for doc in self.documents_mut() {
+                doc.recovery.reconfigure(recovery.clone());
+            }
+        }
         self.auto_pairs = (&config.auto_pairs).into();
         self.reset_idle_timer();
         self._refresh();
@@ -2884,6 +2900,9 @@ impl Editor {
                 let remove_empty_scratch = !doc.is_modified()
                     // If the buffer has no path and is not modified, it is an empty scratch buffer.
                     && doc.path().is_none()
+                    // A file switch is not an explicit discard of a preserved scratch buffer.
+                    && doc.recovery.path().is_none()
+                    && !doc.recovery_pending()
                     // If the buffer we are changing to is not this buffer
                     && id != doc.id
                     // Ensure the buffer is not displayed in any other splits.
@@ -2993,6 +3012,7 @@ impl Editor {
     pub fn new_file_from_document(&mut self, action: Action, doc: Document) -> DocumentId {
         let id = self.new_document(doc);
         self.switch(id, action);
+        self.check_recovery(id);
         id
     }
 
@@ -3109,7 +3129,62 @@ impl Editor {
             }
         }
 
+        if new_doc {
+            self.check_recovery(id);
+        }
         Ok(id)
+    }
+
+    fn check_recovery(&mut self, id: DocumentId) {
+        if !self.config().recovery.enable {
+            return;
+        }
+        let doc = doc!(self, &id);
+        let path = doc.path().map(Path::to_owned);
+        let cwd = doc.recovery_cwd().to_owned();
+        let config = self.config().recovery.clone();
+        self.recovery_checks
+            .push(tokio::task::spawn_blocking(move || {
+                (id, recovery::discover(&config, path.as_deref(), &cwd))
+            }));
+    }
+
+    fn finish_recovery_check(
+        &self,
+        id: DocumentId,
+        result: anyhow::Result<recovery::Discovery>,
+    ) -> anyhow::Result<Option<String>> {
+        if !self.config().recovery.enable
+            || self
+                .document(id)
+                .is_none_or(|doc| doc.recovery_requires_save())
+        {
+            return Ok(None);
+        }
+        match result {
+            Ok(mut found) => {
+                let owned: Vec<_> = self
+                    .documents()
+                    .filter_map(|doc| doc.recovery.path())
+                    .collect();
+                found.candidates.retain(|path| !owned.contains(path));
+                let mut messages: Vec<_> = found
+                    .candidates
+                    .iter()
+                    .map(|path| {
+                        format!(
+                            "Recovery available: {} (use :recover or :recover <swap-file>)",
+                            path.display()
+                        )
+                    })
+                    .collect();
+                messages.extend(found.warnings.into_iter().map(|(path, error)| {
+                    format!("Cannot inspect recovery file {}: {error}", path.display())
+                }));
+                Ok((!messages.is_empty()).then(|| messages.join("; ")))
+            }
+            Err(error) => Err(error.context("Cannot check recovery files")),
+        }
     }
 
     pub fn close(&mut self, id: ViewId) {
@@ -3225,7 +3300,10 @@ impl Editor {
             }
         }
 
-        let doc = self.documents.remove(&doc_id).unwrap();
+        let mut doc = self.documents.remove(&doc_id).unwrap();
+        if let Err(error) = doc.recovery.close() {
+            self.set_warning(format!("Recovery file retained: {error:#}"));
+        }
 
         // If the document we removed was visible in all views, we will have no more views. We don't
         // want to close the editor just for a simple buffer close, so we need to create a new view
@@ -3498,6 +3576,38 @@ impl Editor {
         .await;
     }
 
+    pub fn poll_recovery(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<anyhow::Result<Option<String>>> {
+        for doc in self.documents_mut() {
+            if !doc.config.load().recovery.enable {
+                doc.recovery.disable();
+            }
+            if let std::task::Poll::Ready(result) = doc.recovery.poll(cx) {
+                return std::task::Poll::Ready(result);
+            }
+        }
+        if let std::task::Poll::Ready(Some(result)) = self.recovery_checks.poll_next_unpin(cx) {
+            return std::task::Poll::Ready(match result {
+                Ok((id, result)) => self.finish_recovery_check(id, result),
+                Err(error) => Err(error.into()),
+            });
+        }
+        std::task::Poll::Pending
+    }
+
+    pub fn recovery_pending(&self) -> bool {
+        !self.recovery_checks.is_empty() || self.documents().any(Document::recovery_pending)
+    }
+
+    /// Only call after a successful intentional exit, never from Drop or a signal handler.
+    pub fn close_recovery(&mut self) -> Vec<anyhow::Error> {
+        self.documents_mut()
+            .filter_map(|doc| doc.recovery.close().err())
+            .collect()
+    }
+
     pub async fn wait_event(&mut self) -> EditorEvent {
         // the loop only runs once or twice and would be better implemented with a recursion + const generic
         // however due to limitations with async functions that can not be implemented right now
@@ -3505,6 +3615,20 @@ impl Editor {
             tokio::select! {
                 biased;
 
+                result = std::future::poll_fn(|cx| {
+                    for doc in self.documents.values_mut() {
+                        if let std::task::Poll::Ready(result) = doc.recovery.poll(cx) {
+                            return std::task::Poll::Ready(result);
+                        }
+                    }
+                    std::task::Poll::Pending
+                }) => return EditorEvent::Recovery(result),
+                Some(result) = self.recovery_checks.next() => {
+                    return EditorEvent::Recovery(match result {
+                        Ok((id, result)) => self.finish_recovery_check(id, result),
+                        Err(error) => Err(error.into()),
+                    });
+                }
                 Some(event) = self.save_queue.next() => {
                     self.write_count -= 1;
                     return EditorEvent::DocumentSaved(event)
@@ -3540,6 +3664,16 @@ impl Editor {
         }
     }
 
+    /// Finalize both ordinary save completions and saves drained during write/quit.
+    pub fn finish_save(&mut self, event: &DocumentSavedEvent) {
+        let Some(doc) = self.document_mut(event.doc_id) else {
+            return;
+        };
+        doc.set_last_saved_revision(event.revision, event.save_time);
+        self.set_doc_path(event.doc_id, &event.path);
+        doc_mut!(self, &event.doc_id).recovery_saved(&event.text);
+    }
+
     pub async fn flush_writes(&mut self) -> anyhow::Result<()> {
         while self.write_count > 0 {
             if let Some(save_event) = self.save_queue.next().await {
@@ -3553,8 +3687,7 @@ impl Editor {
                     }
                 };
 
-                let doc = doc_mut!(self, &save_event.doc_id);
-                doc.set_last_saved_revision(save_event.revision, save_event.save_time);
+                self.finish_save(&save_event);
             }
         }
 

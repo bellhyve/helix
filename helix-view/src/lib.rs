@@ -16,6 +16,7 @@ pub mod info;
 pub mod input;
 pub mod keyboard;
 pub mod persistence;
+pub mod recovery;
 pub mod regex;
 pub mod register;
 pub mod theme;

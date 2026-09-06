@@ -90,6 +90,7 @@ fn request_auto_save(editor: &mut Editor) {
 
     let options = commands::WriteAllOptions {
         force: false,
+        automatic: true,
         write_scratch: false,
         auto_format: false,
         code_actions: false,
@@ -103,6 +104,9 @@ fn request_auto_save(editor: &mut Editor) {
 pub(super) fn register_hooks(handlers: &Handlers) {
     let tx = handlers.auto_save.clone();
     register_hook!(move |event: &mut DocumentDidChange<'_>| {
+        if event.doc.is_recovering() {
+            return Ok(());
+        }
         let config = event.doc.config.load();
         if config.auto_save.after_delay.enable {
             send_blocking(

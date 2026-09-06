@@ -19,6 +19,7 @@ use helix_view::editor::{CloseError, ConfigEvent};
 use helix_view::expansion;
 use helix_view::handlers::BlameEvent;
 use helix_view::persistence;
+use helix_view::recovery;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -150,6 +151,103 @@ fn open(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow:
     }
 
     open_impl(cx, args, Action::Replace)
+}
+
+fn preserve(cx: &mut compositor::Context, _args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let (view, doc) = current!(cx.editor);
+    let path = doc.preserve(view.id)?;
+    cx.editor
+        .set_status(format!("Preserved recovery snapshot: {}", path.display()));
+    Ok(())
+}
+
+fn recover(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    // Deferred formatter/code-action tails can still request writes of the live buffer.
+    ensure!(
+        cx.editor.write_count == 0 && cx.jobs.wait_futures.is_empty(),
+        "Wait for pending saves and on-save jobs before recovering"
+    );
+    let config = cx.editor.config().recovery.clone();
+    let doc = doc!(cx.editor);
+    if args.is_empty() {
+        ensure!(!doc.is_modified(), "Cannot recover into a modified buffer");
+    }
+    let cwd = doc.recovery_cwd().to_owned();
+    let path = args.first().map(|arg| {
+        helix_stdx::path::canonicalize(helix_stdx::path::expand_tilde(std::path::Path::new(arg)))
+    });
+    let explicit = path.as_deref().and_then(|path| {
+        let result = recovery::read(path);
+        let looks_like_swap = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".helix-recovery-"));
+        (result.is_ok() || looks_like_swap).then_some(result)
+    });
+    let (swap_path, snapshot) = if let Some(result) = explicit {
+        (path.as_ref().unwrap().clone(), result?)
+    } else {
+        let original = path.as_deref().or(doc.path());
+        let found = recovery::discover(&config, original, &cwd)?;
+        ensure!(
+            !found.candidates.is_empty(),
+            "No recovery snapshot found{}",
+            if found.warnings.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ": {}",
+                    found
+                        .warnings
+                        .iter()
+                        .map(|(path, error)| format!("{}: {error}", path.display()))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            }
+        );
+        ensure!(
+            found.candidates.len() == 1,
+            "Multiple recovery snapshots; use :recover <swap-file>: {}",
+            found
+                .candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let swap_path = found.candidates.into_iter().next().unwrap();
+        let snapshot = recovery::read(&swap_path)?;
+        (swap_path, snapshot)
+    };
+    if let Some(path) = snapshot.path.as_deref() {
+        let path = snapshot.cwd.join(path);
+        if let Some(doc) = cx.editor.document_by_path(&path) {
+            ensure!(!doc.is_modified(), "Cannot recover into a modified buffer");
+            ensure!(
+                !doc.recovery_pending(),
+                "Wait for pending recovery I/O before recovering"
+            );
+        }
+        cx.editor.open(&path, Action::Replace)?;
+    } else if doc!(cx.editor).path().is_some() || doc!(cx.editor).is_modified() {
+        cx.editor.new_file(Action::Replace);
+    }
+    cx.editor.enter_normal_mode();
+    let (view, doc) = current!(cx.editor);
+    doc.recover(snapshot, view)?;
+    view.sync_changes(doc);
+    align_view(doc, view, Align::Center);
+    cx.editor.set_warning(format!(
+        "Recovered from {}; nothing written. Review and :write explicitly; remove the old swap manually.",
+        swap_path.display()
+    ));
+    Ok(())
 }
 
 fn open_impl(cx: &mut compositor::Context, args: Args, action: Action) -> anyhow::Result<()> {
@@ -739,7 +837,7 @@ fn set_line_ending(
         _ => bail!("invalid line ending"),
     };
     let (view, doc) = current!(cx.editor);
-    doc.line_ending = line_ending;
+    doc.set_line_ending(line_ending);
 
     let mut pos = 0;
     let transaction = Transaction::change(
@@ -871,6 +969,7 @@ pub struct WriteAllOptions {
     pub write_scratch: bool,
     pub auto_format: bool,
     pub code_actions: bool,
+    pub automatic: bool,
 }
 
 pub fn write_all_impl(
@@ -888,6 +987,9 @@ pub fn write_all_impl(
         .into_iter()
         .filter_map(|id| {
             let doc = doc!(cx.editor, &id);
+            if options.automatic && doc.recovery_requires_save() {
+                return None;
+            }
             if !doc.is_modified() {
                 return None;
             }
@@ -992,6 +1094,7 @@ fn write_all(cx: &mut compositor::Context, args: Args, event: PromptEvent) -> an
         WriteAllOptions {
             force: false,
             write_scratch: true,
+            automatic: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
@@ -1012,6 +1115,7 @@ fn force_write_all(
         WriteAllOptions {
             force: true,
             write_scratch: true,
+            automatic: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
@@ -1031,6 +1135,7 @@ fn write_all_quit(
         WriteAllOptions {
             force: false,
             write_scratch: true,
+            automatic: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
@@ -1051,6 +1156,7 @@ fn force_write_all_quit(
         WriteAllOptions {
             force: true,
             write_scratch: true,
+            automatic: false,
             auto_format: !args.has_flag(WRITE_NO_FORMAT_FLAG.name),
             code_actions: !args.has_flag(WRITE_NO_CODE_ACTIONS_FLAG.name),
         },
@@ -3646,6 +3752,22 @@ const WRITE_NO_CODE_ACTIONS_FLAG: Flag = Flag {
 };
 
 pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
+    TypableCommand {
+        name: "recover",
+        aliases: &["rec"],
+        doc: "Recover a buffer from a crash snapshot without writing anything. Accepts an original filename or a recovery-file path; defaults to the current buffer. Refuses modified buffers.",
+        fun: recover,
+        completer: CommandCompleter::positional(&[completers::filename]),
+        signature: Signature { positionals: (0, Some(1)), ..Signature::DEFAULT },
+    },
+    TypableCommand {
+        name: "preserve",
+        aliases: &["pre"],
+        doc: "Synchronously preserve the current buffer in a recovery sidefile without saving the original. Also works when automatic recovery is disabled.",
+        fun: preserve,
+        completer: CommandCompleter::none(),
+        signature: Signature { positionals: (0, Some(0)), ..Signature::DEFAULT },
+    },
     TypableCommand {
         name: "exit",
         aliases: &["x", "xit"],

@@ -171,8 +171,7 @@ impl History {
             // find a change that matches the primary selection
             .find(|(from, to, _fragment)| Range::new(*from, *to).overlaps(&primary_selection))
             // or use the first change
-            .or_else(|| current_revision.transaction.changes_iter().next())
-            .unwrap();
+            .or_else(|| current_revision.transaction.changes_iter().next())?;
         let pos = current_revision
             .transaction
             .changes()

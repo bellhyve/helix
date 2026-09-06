@@ -520,6 +520,16 @@ impl Application {
                 return false;
             }
 
+            // Input is biased below; service recovery deadlines even during continuous typing.
+            if let Some(result) =
+                futures_util::FutureExt::now_or_never(std::future::poll_fn(|cx| {
+                    self.editor.poll_recovery(cx)
+                }))
+            {
+                self.handle_editor_event(EditorEvent::Recovery(result))
+                    .await;
+            }
+
             use futures_util::StreamExt;
 
             tokio::select! {
@@ -569,7 +579,8 @@ impl Application {
                         // set in `handle_document_write`) can run before the `DocumentSavedEvent` is processed. Slow file I/O on Windows
                         // (atomic_save's rename/fsync dance over the still-open temp file) makes this race observable.
                         // Errors produce an event too, so it cannot hang.
-                        if _idle_handled && self.editor.write_count == 0 {
+                        if _idle_handled && self.editor.write_count == 0
+                            && !self.editor.recovery_pending() {
                             return true;
                         }
                     }
@@ -813,25 +824,18 @@ impl Application {
             }
         };
 
-        let doc = match self.editor.document_mut(doc_save_event.doc_id) {
-            None => {
-                warn!(
-                    "received document saved event for non-existent doc id: {}",
-                    doc_save_event.doc_id
-                );
-
-                return;
-            }
-            Some(doc) => doc,
-        };
+        if self.editor.document(doc_save_event.doc_id).is_none() {
+            warn!(
+                "received document saved event for non-existent doc id: {}",
+                doc_save_event.doc_id
+            );
+            return;
+        }
 
         debug!(
             "document {:?} saved with revision {}",
-            doc.path(),
-            doc_save_event.revision
+            doc_save_event.path, doc_save_event.revision
         );
-
-        doc.set_last_saved_revision(doc_save_event.revision, doc_save_event.save_time);
 
         let lines = doc_save_event.text.len_lines();
         let size = doc_save_event.text.len_bytes();
@@ -863,8 +867,7 @@ impl Application {
             Size::HumanReadable(size, SUFFIX[i])
         };
 
-        self.editor
-            .set_doc_path(doc_save_event.doc_id, &doc_save_event.path);
+        self.editor.finish_save(&doc_save_event);
         // TODO: fix being overwritten by lsp
         self.editor.set_status(format!(
             "'{}' written, {lines}L {size}",
@@ -985,6 +988,16 @@ impl Application {
         log::debug!("received editor event: {:?}", event);
 
         match event {
+            EditorEvent::Recovery(result) => {
+                match result {
+                    Ok(Some(message)) => self.editor.set_warning(message),
+                    Ok(None) => return false,
+                    Err(error) => self
+                        .editor
+                        .set_error(format!("Cannot preserve recovery snapshot: {error:#}")),
+                }
+                helix_event::request_redraw();
+            }
             EditorEvent::DocumentSaved(event) => {
                 self.handle_document_write(event);
                 self.render().await;
@@ -1734,6 +1747,11 @@ impl Application {
         }
 
         self.editor.close_language_servers(None).await;
+
+        // Signals also reach this routine, but only explicit quits empty the view tree.
+        if errs.is_empty() && self.editor.should_close() {
+            errs.extend(self.editor.close_recovery());
+        }
 
         errs
     }

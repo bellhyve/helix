@@ -49,6 +49,7 @@ use crate::{
     editor::Config,
     events::{DocumentDidChange, SelectionDidChange},
     expansion,
+    recovery::{self, Snapshot},
     view::ViewPosition,
     DocumentId, Editor, Theme, View, ViewId,
 };
@@ -159,6 +160,9 @@ pub struct PluginAnnotation {
 
 pub struct Document {
     pub(crate) id: DocumentId,
+    pub(crate) recovery: recovery::State,
+    recovering: bool,
+    recovery_requires_save: bool,
     text: Rope,
     selections: HashMap<ViewId, Selection>,
     view_data: HashMap<ViewId, ViewData>,
@@ -942,6 +946,9 @@ impl Document {
 
         Self {
             id: DocumentId::default(),
+            recovery: recovery::State::default(),
+            recovering: false,
+            recovery_requires_save: false,
             active_snippet: None,
             path: None,
             relative_path: OnceCell::new(),
@@ -1562,6 +1569,7 @@ impl Document {
             Encoding::for_label(label.as_bytes()).ok_or_else(|| anyhow!("unknown encoding"))?;
 
         self.encoding = encoding;
+        self.refresh_recovery_metadata();
 
         Ok(())
     }
@@ -1571,11 +1579,152 @@ impl Document {
         self.encoding
     }
 
+    pub fn set_line_ending(&mut self, line_ending: LineEnding) {
+        self.line_ending = line_ending;
+        self.refresh_recovery_metadata();
+    }
+
+    pub fn recovery_cwd(&self) -> &Path {
+        self.recovery.cwd()
+    }
+
+    pub fn is_recovering(&self) -> bool {
+        self.recovering
+    }
+
+    /// Inhibit previously armed autosave timers until explicit save or a real edit.
+    pub fn recovery_requires_save(&self) -> bool {
+        self.recovery_requires_save
+    }
+
+    pub fn recovery_pending(&self) -> bool {
+        self.recovery.pending()
+    }
+
+    fn recovery_snapshot(&self, view_id: ViewId) -> Snapshot {
+        let selection = self.selection(view_id);
+        Snapshot {
+            path: self.path.clone(),
+            cwd: self.recovery.cwd().to_owned(),
+            text: self.text.clone(),
+            encoding: self.encoding.name().to_owned(),
+            has_bom: self.has_bom,
+            line_ending: format!("{:?}", self.line_ending).to_lowercase(),
+            selections: selection
+                .iter()
+                .map(|range| (range.anchor, range.head))
+                .collect(),
+            primary: selection.primary_index(),
+        }
+    }
+
+    pub fn preserve(&mut self, view_id: ViewId) -> anyhow::Result<PathBuf> {
+        let snapshot = self.recovery_snapshot(view_id);
+        let config = self.config.load().recovery.clone();
+        self.recovery.preserve(snapshot, config)
+    }
+
+    pub(crate) fn recovery_saved(&mut self, text: &Rope) {
+        // A save started before recovery may complete afterwards. Only the
+        // recovered revision's own successful save releases its autosave guard.
+        if !self.is_modified() {
+            self.recovery_requires_save = false;
+            self.recovery.saved_text(text);
+        }
+        self.refresh_recovery_metadata();
+    }
+
+    fn refresh_recovery_metadata(&mut self) {
+        let config = self.config.load().recovery.clone();
+        self.recovery.refresh(
+            self.path.clone(),
+            self.encoding.name().to_owned(),
+            self.has_bom,
+            format!("{:?}", self.line_ending).to_lowercase(),
+            config,
+        );
+    }
+
+    pub fn recover(&mut self, snapshot: Snapshot, view: &View) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.is_modified(), "Cannot recover into a modified buffer");
+        anyhow::ensure!(
+            !self.recovery.pending(),
+            "Wait for pending recovery I/O before recovering"
+        );
+        anyhow::ensure!(!self.readonly, "Cannot recover into a readonly buffer");
+        let encoding = Encoding::for_label(snapshot.encoding.as_bytes())
+            .ok_or_else(|| anyhow!("Unknown recovery encoding: {}", snapshot.encoding))?;
+        let line_ending = match snapshot.line_ending.as_str() {
+            "crlf" => Some(LineEnding::Crlf),
+            "lf" => Some(LineEnding::LF),
+            "vt" => LineEnding::from_char('\u{000b}'),
+            "ff" => LineEnding::from_char('\u{000c}'),
+            "cr" => LineEnding::from_char('\r'),
+            "nel" => LineEnding::from_char('\u{0085}'),
+            "ls" => LineEnding::from_char('\u{2028}'),
+            "ps" => LineEnding::from_char('\u{2029}'),
+            _ => None,
+        }
+        .ok_or_else(|| anyhow!("Unknown recovery line ending: {:?}", snapshot.line_ending))?;
+        anyhow::ensure!(
+            snapshot.primary < snapshot.selections.len()
+                && snapshot.selections.iter().all(|&(anchor, head)| {
+                    anchor <= snapshot.text.len_chars() && head <= snapshot.text.len_chars()
+                }),
+            "Invalid recovery selections"
+        );
+        let selection = Selection::new(
+            snapshot
+                .selections
+                .iter()
+                .map(|&(anchor, head)| Range::new(anchor, head))
+                .collect(),
+            snapshot.primary,
+        )
+        .ensure_invariants(snapshot.text.slice(..));
+        let old_state = State {
+            doc: self.text.clone(),
+            selection: self.selection(view.id).clone(),
+        };
+        // A full replacement also creates a history revision for equal content.
+        let transaction = Transaction::change(
+            &self.text,
+            std::iter::once((
+                0,
+                self.text.len_chars(),
+                Some(snapshot.text.to_string().into()),
+            )),
+        )
+        .with_selection(selection);
+        self.recovering = true;
+        let success = self.apply(&transaction, view.id);
+        self.recovering = false;
+        anyhow::ensure!(success, "Could not apply recovery snapshot");
+        self.encoding = encoding;
+        self.has_bom = snapshot.has_bom;
+        self.line_ending = line_ending;
+        self.recovery_requires_save = true;
+        // No mutable view is available here. Its next sync_changes catches up
+        // with this revision, exactly as for changes made from another view.
+        self.history
+            .get_mut()
+            .commit_revision(&transaction, &old_state);
+        self.changes = ChangeSet::new(self.text.slice(..));
+        self.old_state = None;
+        if self.config.load().recovery.enable {
+            self.recovery.recovered(self.recovery_snapshot(view.id));
+        } else {
+            self.recovery.disable();
+        }
+        Ok(())
+    }
+
     /// sets the document path without sending events to various
     /// observers (like LSP), in most cases `Editor::set_doc_path`
     /// should be used instead
     pub fn set_path(&mut self, path: Option<&Path>) {
         let path = path.map(helix_stdx::path::canonicalize);
+        let path_changed = self.path != path;
 
         // `take` to remove any prior relative path that may have existed.
         // This will get set in `relative_path()`.
@@ -1586,6 +1735,10 @@ impl Document {
         // if parent doesn't exist we still want to open the document
         // and error out when document is saved
         self.path = path;
+
+        if path_changed {
+            self.refresh_recovery_metadata();
+        }
 
         self.detect_readonly();
         self.pickup_last_saved_time();
@@ -1731,6 +1884,9 @@ impl Document {
         }
 
         self.modified_since_accessed = true;
+        if emit_lsp_notification && !self.recovering {
+            self.recovery_requires_save = false;
+        }
         self.version += 1;
 
         for container in self.fold_container.values_mut() {
@@ -1899,6 +2055,24 @@ impl Document {
                 view_id,
                 selection.clone().ensure_invariants(self.text.slice(..)),
             );
+        }
+
+        if emit_lsp_notification && !self.recovering {
+            let config = self.config.load().recovery.clone();
+            if config.enable {
+                let changed_chars = changes.changes().iter().fold(0usize, |count, operation| {
+                    use helix_core::Operation;
+                    count.saturating_add(match operation {
+                        Operation::Insert(text) => text.chars().count(),
+                        Operation::Delete(count) => *count,
+                        Operation::Retain(_) => 0,
+                    })
+                });
+                self.recovery
+                    .record(self.recovery_snapshot(view_id), config, changed_chars);
+            } else {
+                self.recovery.disable();
+            }
         }
 
         true

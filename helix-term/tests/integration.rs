@@ -21,5 +21,6 @@ mod test {
     mod commands;
     mod movement;
     mod persistence;
+    mod recovery;
     mod splits;
 }

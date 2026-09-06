@@ -2428,6 +2428,7 @@ impl Component for EditorView {
             Event::FocusLost => {
                 if context.editor.config().auto_save.focus_lost {
                     let options = commands::WriteAllOptions {
+                        automatic: true,
                         force: false,
                         write_scratch: false,
                         auto_format: false,

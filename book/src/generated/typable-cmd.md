@@ -1,5 +1,7 @@
 | Name | Description |
 | --- | --- |
+| `:recover`, `:rec` | Recover a buffer from a crash snapshot without writing anything. Accepts an original filename or a recovery-file path; defaults to the current buffer. Refuses modified buffers. |
+| `:preserve`, `:pre` | Synchronously preserve the current buffer in a recovery sidefile without saving the original. Also works when automatic recovery is disabled. |
 | `:exit`, `:x`, `:xit` | Write changes to disk if the buffer is modified and then quit. Accepts an optional path (:exit some/path.txt). |
 | `:exit!`, `:x!`, `:xit!` | Force write changes to disk, creating necessary subdirectories, if the buffer is modified and then quit. Accepts an optional path (:exit! some/path.txt). |
 | `:quit`, `:q` | Close the current view. |
